@@ -8,13 +8,12 @@ from langchain.llms.bedrock import Bedrock
 
 import streamlit as st
 import pickle
-from PyPDF2 import PdfReader
+import tempfile
 from streamlit_extras.add_vertical_space import add_vertical_space
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import BedrockEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders.csv_loader import CSVLoader
 
 boto_session = boto3.Session()
 aws_region = boto_session.region_name
@@ -38,52 +37,49 @@ with st.sidebar:
 
 
 def main():
-    st.header("Chat with Files 💬")
+    st.header("Chat with CSV Files 💬")
 
     # upload a PDF file
-    pdf = st.file_uploader("Upload your (PDF/csv)", type='pdf')
-    # st.write(pdf)
-    if pdf is not None:
-        pdf_reader = PdfReader(pdf)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-        #st.write(text)
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-            )
-        chunks = text_splitter.split_text(text=text)
-        #st.write(chunks)
+    file = st.file_uploader("Upload your file", type="csv")
 
-       # embeddings
-        store_name = pdf.name[:-4]
-        #st.write(f'{store_name}')
+    if file is not None:
+        store_name = file.name[-3:]
+        # CSVLoader looks for a filepath, so use tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(file.getvalue())
+            tmp_file_path = tmp_file.name
+        loader = CSVLoader(file_path=tmp_file_path,
+                           encoding="utf-8",
+                           csv_args={"delimiter": ","})
+        data = loader.load()
+
+   # embeddings
+        store_name = file.name[:-4]
+        st.write(f'{store_name}')
         # st.write(chunks)
-
         if os.path.exists(f"{store_name}.pkl"):
-           embeddings = BedrockEmbeddings(model_id='amazon.titan-embed-text-v1', client=br_runtime)
-           VectorStore = FAISS.from_texts(chunks, embedding=embeddings)
+            embeddings = BedrockEmbeddings(model_id='amazon.titan-embed-text-v1', client=br_runtime)
+            VectorStore = FAISS.from_documents(data, embedding=embeddings)
             #with open(f"{store_name}.pkl", "rb") as f:
              #   VectorStore = pickle.load(f)
               #  st.write('Embeddings Loaded from the Disk')
         else:
             embeddings = BedrockEmbeddings(model_id='amazon.titan-embed-text-v1', client=br_runtime)
-            VectorStore = FAISS.from_texts(chunks, embedding=embeddings)
+            VectorStore = FAISS.from_documents(data, embedding=embeddings)
+            
             #with open(f"{store_name}.pkl", "wb") as f:
              #   pickle.dump(VectorStore, f)
               #  st.write('Embeddings Completed')
 
+        llm = Bedrock(model_id='anthropic.claude-v2:1', client=br_runtime)
+        chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=VectorStore.as_retriever())
         # Accept user questions/query
-        query = st.text_input("Ask questions about your PDF file:")
+        query = st.text_area("Ask questions about your file:")
         #st.write(query)
         if query:
-            docs = VectorStore.similarity_search(query=query, k=3)
-            llm = Bedrock(model_id='anthropic.claude-v2:1', client=br_runtime)
-            chain = load_qa_chain(llm=llm, chain_type="stuff")
-            response = chain.run(input_documents=docs, question=query)
-            st.write(response)
+            result = chain({"question": query, "chat_history": st.session_state['history']})
+            st.session_state['history'].append((query, result["answer"]))
+            return result["answer"]
      
 if __name__ == '__main__':
     main()
